@@ -1,0 +1,219 @@
+# Service Account for Web Server
+- name: webserver-service-account
+  type: iam.v1.serviceAccount
+  properties:
+    accountId: webserver-sa
+    displayName: Web Server Service Account
+
+# Bind roles to the Web Server Service Account
+- name: webserver-sa-storage-admin-binding
+  type: gcp-types/storage-v1:virtual.buckets.iamMemberBinding
+  properties:
+    bucket: jeremybui_hw10
+    role: roles/storage.objectAdmin
+    member: serviceAccount:$(ref.webserver-service-account.email)
+
+- name: webserver-sa-cloudsql-client-binding
+  type: gcp-types/cloudresourcemanager-v1:virtual.projects.iamMemberBinding
+  properties:
+    resource: $(projectId)
+    role: roles/cloudsql.client
+    member: serviceAccount:$(ref.webserver-service-account.email)
+
+# Service Account for Listener VM
+- name: listener-service-account
+  type: iam.v1.serviceAccount
+  properties:
+    accountId: listener-sa
+    displayName: Listener Service Account
+
+# Bind roles to the Listener Service Account
+- name: listener-sa-storage-admin-binding
+  type: gcp-types/storage-v1:virtual.buckets.iamMemberBinding
+  properties:
+    bucket: jeremybui_hw10
+    role: roles/storage.objectViewer
+    member: serviceAccount:$(ref.listener-service-account.email)
+
+- name: listener-sa-pubsub-subscriber-binding
+  type: gcp-types/pubsub-v1:projects.subscriptions.iamMemberBinding
+  properties:
+    subscription: banned-country-subscription
+    role: roles/pubsub.subscriber
+    member: serviceAccount:$(ref.listener-service-account.email)
+
+# Firewall rule to allow HTTP and HTTPS
+- name: allow-http-https
+  type: compute.v1.firewall
+  properties:
+    network: global/networks/default
+    allowed:
+      - IPProtocol: TCP
+        ports:
+          - "80"
+          - "443"
+    direction: INGRESS
+    sourceRanges:
+      - 0.0.0.0/0
+    targetTags:
+      - http-server
+      - https-server
+
+# Cloud SQL Instance
+- name: sql-instance
+  type: sqladmin.v1beta4.instance
+  properties:
+    name: hw10-sql-instance
+    region: us-central1
+    databaseVersion: MYSQL_5_7
+    settings:
+      tier: db-f1-micro
+      backupConfiguration:
+        enabled: true
+        startTime: "23:00"
+      ipConfiguration:
+        ipv4Enabled: true
+        authorizedNetworks:
+          - value: "0.0.0.0/0"
+      userLabels:
+        environment: production
+    instanceType: CLOUD_SQL_INSTANCE
+    rootPassword: ""
+
+# SQL Database
+- name: hw10-database
+  type: sqladmin.v1beta4.database
+  metadata:
+    dependsOn:
+      - sql-instance
+  properties:
+    name: hw10-database
+    instance: $(ref.sql-instance.name)
+
+# GCS Bucket for HW10
+- name: jeremybui_hw10
+  type: storage.v1.bucket
+  properties:
+    location: US
+    storageClass: STANDARD
+    iamConfiguration:
+      bucketPolicyOnly:
+        enabled: true
+
+# Copy Files to New Bucket
+- name: copy-files-to-hw10
+  action: gcp-types/storage-v1:storage.objects.copy
+  metadata:
+    dependsOn:
+      - jeremybui_hw10
+  properties:
+    sourceBucket: jeremybui_ps2
+    sourceObject: files/
+    destinationBucket: jeremybui_hw10
+    destinationObject: files/
+
+# Pub/Sub Topic
+- name: banned-country-topic
+  type: pubsub.v1.topic
+  properties:
+    topic: banned-country-topic
+
+# Pub/Sub Subscription
+- name: banned-country-subscription
+  type: pubsub.v1.subscription
+  metadata:
+    dependsOn:
+      - banned-country-topic
+  properties:
+    subscription: banned-country-subscription
+    topic: $(ref.banned-country-topic.name)
+    ackDeadlineSeconds: 20
+
+# Web Server VM
+- name: webserver-vm
+  type: compute.v1.instance
+  metadata:
+    dependsOn:
+      - sql-instance
+      - hw10-database
+  properties:
+    zone: us-central1-a
+    machineType: zones/us-central1-a/machineTypes/f1-micro
+    tags:
+      items:
+        - http-server
+        - https-server
+    serviceAccounts:
+      - email: $(ref.webserver-service-account.email)
+        scopes:
+          - https://www.googleapis.com/auth/cloud-platform
+    disks:
+      - boot: true
+        autoDelete: true
+        initializeParams:
+          sourceImage: projects/debian-cloud/global/images/family/debian-11
+    networkInterfaces:
+      - network: global/networks/default
+        accessConfigs:
+          - name: External NAT
+            type: ONE_TO_ONE_NAT
+    metadata:
+      items:
+        - key: enable-oslogin
+          value: "TRUE"
+        - key: startup-script
+          value: |
+            #!/bin/bash
+            sudo apt-get update && sudo apt-get install -y python3 python3-pip google-cloud-sdk
+            sudo pip3 install google-cloud-storage google-cloud-logging google-cloud-pubsub mysql-connector-python
+
+            VM_IP=$(curl -s http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip -H "Metadata-Flavor: Google")
+
+            gcloud sql instances patch hw10-sql-instance --authorized-networks=${VM_IP}/32
+
+            gsutil -m cp -r gs://jeremybui_ps2/files/* gs://jeremybui_hw10/files/
+
+            gsutil -m cp gs://jeremybui_ps2/web-server.py ~/web-server.py
+
+            sudo python3 ~/web-server.py $(gcloud sql instances describe hw10-sql-instance --format="get(ipAddresses[0].ipAddress)") hw10-db banned-country-topic &
+
+# Listener VM for Pub/Sub
+- name: listener-vm
+  type: compute.v1.instance
+  metadata:
+    dependsOn:
+      - banned-country-subscription
+  properties:
+    zone: us-central1-a
+    machineType: zones/us-central1-a/machineTypes/f1-micro
+    tags:
+      items:
+        - http-server
+        - https-server
+    serviceAccounts:
+      - email: $(ref.listener-service-account.email)
+        scopes:
+          - https://www.googleapis.com/auth/cloud-platform
+    disks:
+      - boot: true
+        autoDelete: true
+        initializeParams:
+          sourceImage: projects/debian-cloud/global/images/family/debian-11
+    networkInterfaces:
+      - network: global/networks/default
+        accessConfigs:
+          - name: External NAT
+            type: ONE_TO_ONE_NAT
+    metadata:
+      items:
+        - key: enable-oslogin
+          value: "TRUE"
+        - key: startup-script
+          value: |
+            #!/bin/bash
+            sudo apt-get update && sudo apt-get install -y python3 python3-pip google-cloud-sdk
+            sudo pip3 install google-cloud-storage google-cloud-logging google-cloud-pubsub
+
+            gsutil -m cp gs://jeremybui_ps2/pubsub-listener.py ~/pubsub-listener.py
+
+            sudo python3 ~/pubsub-listener.py banned-country-subscription
